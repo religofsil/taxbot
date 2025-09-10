@@ -4,3 +4,6 @@ requests>=2.0
 openpyxl>=3.1
 XlsxWriter>=3.2
 python-dotenv>=0.21
+gspread>=6.0.0
+gspread-dataframe>=4.0.0
+google-auth>=2.0.0

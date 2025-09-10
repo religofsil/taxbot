@@ -54,3 +54,6 @@ ENV/
 # Editor backups and swap files
 *~
 *.swp
+
+# keys
+*.json

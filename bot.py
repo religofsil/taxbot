@@ -1,84 +1,94 @@
+# ---------- Imports ----------
 import asyncio
 import os
+import re
 from io import BytesIO
 from datetime import datetime, date
-from dotenv import load_dotenv
-load_dotenv()
-import logging
-
-# Configure logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
 
 import pandas as pd
+import gspread
+from google.oauth2.service_account import Credentials
+from gspread_dataframe import get_as_dataframe
 from telegram import Update, InputFile, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, ConversationHandler,
     ContextTypes, filters
 )
 from requests import get
+from dotenv import load_dotenv
 
-# States
-AWAIT_SELECTION = 0
-AWAIT_FILE = 1
-AWAIT_PREV_AMOUNT = 2
+# ---------- Configuration ----------
+load_dotenv()
+
+import logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# ---------- Constants ----------
+AWAIT_LANGUAGE = 0
+AWAIT_SELECTION = 1
+AWAIT_FILE = 2
+AWAIT_PREV_AMOUNT = 3
 
 ALLOWED_CURRENCIES = {"GEL", "EUR", "USD"}
 ALLOWED_SOURCES = {
     "Bank transaction",
-    "POS terminal payment",
+    "POS terminal payment", 
     "Cash",
     "Payment system: PayPal, Wise, Deel, etc.",
 }
 
-FIELD_MAP = {
-    15: ("gel_ytd", None),   # GEL total since Jan 1 this year to today (inclusive)
-    18: ("source",  "Cash"),
-    19: ("source",  "POS terminal payment"),
-    20: ("source",  "Bank transaction"),
-    21: ("source",  "Payment system: PayPal, Wise, Deel, etc."),
-}
+# ---------- Utility Functions ----------
+def to_num(s):
+    """Convert string to numeric value, handling various formats."""
+    if pd.isna(s): 
+        return pd.NA
+    s = str(s).strip()
+    s = re.sub(r"[^\d,.\-]", "", s)       # drop currency/whitespace
+    if s.count(",")==1 and "." not in s:  # handle 1,23 -> 1.23
+        s = s.replace(",", ".")
+    return pd.to_numeric(s, errors="coerce")
 
-# ---------- Helpers ----------
+def normalize_column_names(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize Russian column names to English for processing."""
+    column_mapping = {
+        'Сумма транзакции': 'Transaction amount',
+        'Валюта': 'Currency',
+        'Дата транзакции': 'Transaction date',
+        'Источник дохода': 'Income source'
+    }
+    
+    # Create a copy to avoid modifying original
+    df_normalized = df.copy()
+    
+    # Rename columns using the mapping
+    df_normalized.columns = [column_mapping.get(col, col) for col in df_normalized.columns]
+    
+    return df_normalized
 
-def build_template_bytes() -> BytesIO:
-    """
-    Columns (exact order):
-    Transaction amount, Currency, Transaction date, Income source
-    """
-    df = pd.DataFrame({
-        "Transaction amount": [100.00],
-        "Currency": ["GEL"],
-        "Transaction date": [pd.Timestamp(date.today())],
-        "Income source": ["Payment system: PayPal, Wise, Deel, etc."],
-    })
-    bio = BytesIO()
-    with pd.ExcelWriter(bio, engine="xlsxwriter", datetime_format="yyyy-mm-dd") as xw:
-        df.to_excel(xw, index=False, sheet_name="Data")
-        ws = xw.sheets["Data"]
-        ws.set_column("A:A", 22)
-        ws.set_column("B:B", 10)
-        ws.set_column("C:C", 16)
-        ws.set_column("D:D", 40)
-    bio.seek(0)
-    return bio
-
-def build_instructions() -> str:
-    return (
-        "Template rules:\n"
-        "• Columns (order): Transaction amount, Currency, Transaction date, Income source\n"
-        "• Currency: GEL, EUR, USD\n"
-        "• Date: YYYY-MM-DD\n"
-        "• Income source:\n"
-        "  – Bank transaction\n"
-        "  – POS terminal payment\n"
-        "  – Cash\n"
-        "  – Payment system: PayPal, Wise, Deel, etc.\n"
-        "Send the filled .xlsx back here."
-    )
+def crop_to_last_transaction(df: pd.DataFrame) -> pd.DataFrame:
+    """Crop DataFrame to remove empty rows after the last filled transaction."""
+    # Check for both English and Russian column names
+    amount_col = None
+    for col in ['Transaction amount', 'Сумма транзакции']:
+        if col in df.columns:
+            amount_col = col
+            break
+    
+    if amount_col is None:
+        return df
+    
+    # Find the last row with a non-null Transaction amount
+    last_filled_idx = df[amount_col].last_valid_index()
+    
+    if last_filled_idx is not None:
+        # Crop the DataFrame to include only up to the last filled row
+        df = df.iloc[:last_filled_idx + 1].copy()
+    
+    return df
 
 def get_currency_rate(currency: str, on_date: date) -> float:
     """
@@ -114,27 +124,60 @@ def get_currency_rate(currency: str, on_date: date) -> float:
         print(f"❌ Error getting rate for {currency} on {on_date}: {e}")
         raise
 
-def load_and_process_tax_data(file_path: str, sheet_name: str = 'Data', prev_month_amount: float = 0.0) -> pd.DataFrame:
-    """
-    Load tax data from Excel file and process it with currency conversion.
+def get_tax_dataframe_from_file(file_bytes: BytesIO) -> pd.DataFrame:
+    """Read and validate tax data from .xlsx file bytes."""
+    df = pd.read_excel(BytesIO(file_bytes), sheet_name='Data')
     
-    Args:
-        file_path (str): Path to the Excel file containing tax data
-        sheet_name (str): Name of the sheet to read from
-        prev_month_amount (float): Previous month's amount in GEL (optional)
-        
-    Returns:
-        pd.DataFrame: Processed DataFrame with currency rates and GEL amounts
-    """
-    print(f"📊 Loading tax data from: {file_path}")
+    # Normalize column names (Russian to English)
+    df = normalize_column_names(df)
+    df = crop_to_last_transaction(df)
     
-    # Load the data
-    df = pd.read_excel(file_path, sheet_name=sheet_name)
-    print(f"✅ Loaded {len(df)} transactions")
+    # Validate required columns
+    required_columns = ['Transaction amount', 'Currency', 'Transaction date', 'Income source']
+    for col in required_columns:
+        if col not in df.columns:
+            raise ValueError(f"Missing required column: {col}")
     
-    # Convert transaction dates to proper date format if needed
+    return df
+
+def get_tax_dataframe_from_sheet(link: str, creds_path: str) -> pd.DataFrame:
+    """Read and validate tax data from Google Sheets."""
+    sheet_id_match = re.search(r"/d/([a-zA-Z0-9_-]+)", link)
+    if not sheet_id_match:
+        raise ValueError("Invalid Google Sheets link")
+    sheet_id = sheet_id_match.group(1)
+    
+    creds = Credentials.from_service_account_file(
+        creds_path,
+        scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"],
+    )
+    client = gspread.authorize(creds)
+    sheet = client.open_by_key(sheet_id).sheet1
+    df = get_as_dataframe(sheet, evaluate_formulas=True, header=0)
+    
+    # Normalize column names (Russian to English)
+    df = normalize_column_names(df)
+    
+    # Clean up the DataFrame
+    df = crop_to_last_transaction(df)
+    
+    # Convert Transaction amount to numeric (handle both original and normalized names)
+    amount_col = 'Transaction amount'
+    if amount_col in df.columns:
+        df[amount_col] = df[amount_col].map(to_num)
+    
+    return df
+
+def process_tax_dataframe(df: pd.DataFrame, prev_month_amount: float = 0.0) -> pd.DataFrame:
+    """Process tax DataFrame with currency conversion and calculations."""
+    print(f"✅ Processing {len(df)} transactions")
+    
+    # Convert transaction dates to proper date format
     if 'Transaction date' in df.columns:
-        df['Transaction date'] = pd.to_datetime(df['Transaction date']).dt.date
+        df['Transaction date'] = pd.to_datetime(df['Transaction date'],
+            format="%d.%m.%Y",   # matches 14.08.2025
+            errors="coerce"      # invalid dates become NaT
+        ).dt.date
     
     # Get currency rates for each transaction
     print("🔄 Fetching currency rates...")
@@ -143,7 +186,7 @@ def load_and_process_tax_data(file_path: str, sheet_name: str = 'Data', prev_mon
     # Calculate amounts in GEL
     df['amount_in_gel'] = df['Transaction amount'] * df['rate']
     
-    # Calculate year-to-date total
+    # Calculate totals
     current_month_total = df['amount_in_gel'].sum()
     df.attrs['ytd_total'] = current_month_total + prev_month_amount
     df.attrs['current_month_total'] = current_month_total
@@ -155,12 +198,13 @@ def load_and_process_tax_data(file_path: str, sheet_name: str = 'Data', prev_mon
     return df
 
 def summarize_income(df: pd.DataFrame, prev_amount: float) -> dict:
-    '''Field 15: year-to-date GEL; 18: Cash; 19: POS terminal; 20: Bank transaction; 21: Payment system.'''
+    """Summarize income by fields for tax declaration."""
     field15 = df['amount_in_gel'].sum() + prev_amount
     field18 = df[df['Income source'] == 'Cash']['amount_in_gel'].sum()
     field19 = df[df['Income source'] == 'POS terminal payment']['amount_in_gel'].sum()
     field20 = df[df['Income source'] == 'Bank transaction']['amount_in_gel'].sum()
     field21 = df[df['Income source'] == 'Payment system: PayPal, Wise, Deel, etc.']['amount_in_gel'].sum()
+    
     return {
         'Field 15': field15,
         'Field 18': field18,
@@ -169,87 +213,362 @@ def summarize_income(df: pd.DataFrame, prev_amount: float) -> dict:
         'Field 21': field21,
     }
 
-# ---------- Handlers ----------
+# ---------- Template Generation ----------
+def build_template_bytes(lang: str = "en") -> BytesIO:
+    """Build an Excel template file for tax data entry."""
+    import xlsxwriter
+    
+    # Create a new workbook and worksheet
+    output = BytesIO()
+    workbook = xlsxwriter.Workbook(output, {'in_memory': True})
+    worksheet = workbook.add_worksheet('Data')
+    
+    # Define formats
+    header_format = workbook.add_format({
+        'bold': True,
+        'bg_color': '#D7E4BC',
+        'border': 1
+    })
+    
+    cell_format = workbook.add_format({
+        'border': 1
+    })
+    
+    date_format = workbook.add_format({
+        'num_format': 'dd.mm.yyyy',
+        'border': 1
+    })
+    
+    # Define headers based on language
+    if lang == "ru":
+        headers = ['Сумма транзакции', 'Валюта', 'Дата транзакции', 'Источник дохода']
+        sample_data = [
+            [1000, 'USD', '01.01.1999', 'Bank transaction'],
+            [500, 'EUR', '02.01.1999', 'Payment system: PayPal, Wise, Deel, etc.'],
+            [200, 'GEL', '03.01.1999', 'Cash'],
+            [300, 'USD', '04.01.1999', 'POS terminal payment'],
+        ]
+    else:
+        headers = ['Transaction amount', 'Currency', 'Transaction date', 'Income source']
+        sample_data = [
+            [1000, 'USD', '01.01.1999', 'Bank transaction'],
+            [500, 'EUR', '02.01.1999', 'Payment system: PayPal, Wise, Deel, etc.'],
+            [200, 'GEL', '03.01.1999', 'Cash'],
+            [300, 'USD', '04.01.1999', 'POS terminal payment'],
+        ]
+    
+    # Write headers
+    for col, header in enumerate(headers):
+        worksheet.write(0, col, header, header_format)
+    
+    # Set column widths
+    worksheet.set_column(0, 0, 18)  # Transaction amount
+    worksheet.set_column(1, 1, 10)  # Currency
+    worksheet.set_column(2, 2, 18)  # Transaction date
+    worksheet.set_column(3, 3, 25)  # Income source
+    
+    # Add sample data
+    for row, data in enumerate(sample_data, 1):
+        for col, value in enumerate(data):
+            if col == 2:  # Date column
+                worksheet.write_datetime(row, col, datetime.strptime(value, '%d.%m.%Y'), date_format)
+            else:
+                worksheet.write(row, col, value, cell_format)
+    
+    # Add data validation for currency
+    worksheet.data_validation(1, 1, 1000, 1, {
+        'validate': 'list',
+        'source': ['GEL', 'USD', 'EUR']
+    })
+    
+    # Add data validation for income source
+    income_sources = [
+        'Bank transaction',
+        'POS terminal payment',
+        'Cash',
+        'Payment system: PayPal, Wise, Deel, etc.'
+    ]
+    worksheet.data_validation(1, 3, 1000, 3, {
+        'validate': 'list',
+        'source': income_sources
+    })
+    
+    workbook.close()
+    output.seek(0)
+    return output
 
+def build_instructions() -> str:
+    """Build instruction text for the template."""
+    return (
+        "📊 TAX CALCULATION BOT FOR GEORGIA\n\n"
+        "This bot helps you calculate tax declaration fields for Georgia Revenue Service.\n\n"
+        "📋 HOW IT WORKS:\n"
+        "1. Download the Excel template below\n"
+        "2. Fill in your transaction data\n"
+        "3. Send the completed file back to this bot\n"
+        "4. Get calculated amounts for tax declaration fields\n\n"
+        "📝 BASIC RULES:\n"
+        "• Columns: Transaction amount, Currency, Transaction date, Income source\n"
+        "• Currency: GEL, EUR, USD\n"
+        "• Date: DD.MM.YYYY (e.g., 14.08.2025)\n"
+        "• Formats: Excel (.xlsx) or Google Sheets links"
+    )
+
+def build_detailed_income_instructions_en() -> str:
+    """Build detailed income source instructions in English."""
+    return (
+        "📝 INCOME SOURCE - WRITE EXACTLY:\n\n"
+        "• \"Bank transaction\" - for:\n"
+        "  ✓ Wire transfers to your bank account\n"
+        "  ✓ Direct deposits from clients\n"
+        "  ✓ International bank transfers (SWIFT)\n"
+        "  ✓ Local bank transfers within Georgia\n\n"
+        "• \"POS terminal payment\" - for:\n"
+        "  ✓ Card payments at physical locations\n"
+        "  ✓ Contactless payments (NFC)\n"
+        "  ✓ Chip & PIN transactions\n"
+        "  ✓ Any payment via card reader/terminal\n\n"
+        "• \"Cash\" - for:\n"
+        "  ✓ Physical cash payments received\n"
+        "  ✓ Cash tips or bonuses\n"
+        "  ✓ Cash exchanges (currency to cash)\n\n"
+        "• \"Payment system: PayPal, Wise, Deel, etc.\" - for:\n"
+        "  ✓ PayPal payments\n"
+        "  ✓ Wise (ex-TransferWise) transfers\n"
+        "  ✓ Deel, Upwork, Fiverr payments\n"
+        "  ✓ Stripe, Square payments\n"
+        "  ✓ Skrill, Payoneer, Remitly\n"
+        "  ✓ Any online payment platform\n\n"
+        "⚠️ IMPORTANT: Copy-paste the exact text from the options above!"
+    )
+
+def build_detailed_income_instructions_ru() -> str:
+    """Build detailed income source instructions in Russian."""
+    return (
+        "📝 ИСТОЧНИК ДОХОДА - ПИШИТЕ ТОЧНО:\n\n"
+        "• \"Bank transaction\" - для:\n"
+        "  ✓ Банковских переводов на ваш счет\n"
+        "  ✓ Прямых депозитов от клиентов\n"
+        "  ✓ Международных переводов (SWIFT)\n"
+        "  ✓ Местных переводов внутри Грузии\n\n"
+        "• \"POS terminal payment\" - для:\n"
+        "  ✓ Оплат картой в физических точках\n"
+        "  ✓ Бесконтактных платежей (NFC)\n"
+        "  ✓ Транзакций чип+PIN\n"
+        "  ✓ Любых платежей через терминал\n\n"
+        "• \"Cash\" - для:\n"
+        "  ✓ Наличных платежей\n"
+        "  ✓ Чаевых или бонусов наличными\n"
+        "  ✓ Обмена валюты на наличные\n\n"
+        "• \"Payment system: PayPal, Wise, Deel, etc.\" - для:\n"
+        "  ✓ Платежей PayPal\n"
+        "  ✓ Переводов Wise (ex-TransferWise)\n"
+        "  ✓ Выплат Deel, Upwork, Fiverr\n"
+        "  ✓ Платежей Stripe, Square\n"
+        "  ✓ Skrill, Payoneer, Remitly\n"
+        "  ✓ Любых онлайн-платформ\n\n"
+        "⚠️ ВАЖНО: Копируйте точный текст из вариантов выше!"
+    )
+
+# ---------- Bot Handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle /start command - show language selection."""
     logger.info(f"User {update.effective_user.id} initiated /start")
-    # Show button to receive the template
-    keyboard = [["Receive template"]]
+    
+    keyboard = [["Русский", "English"]]
     reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
     await update.message.reply_text(
-        "Welcome! Click the button below to get the tax data template:",
+        "Выберите язык / Choose your language:",
         reply_markup=reply_markup
     )
+    return AWAIT_LANGUAGE
+
+async def select_language(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle language selection."""
+    lang = update.message.text.strip().lower()
+    
+    if lang in ["русский", "ru"]:
+        context.user_data["lang"] = "ru"
+        welcome = (
+            "🎉 Добро пожаловать в бот для расчета налогов в Грузии!\n\n"
+            "Этот бот поможет вам автоматически рассчитать поля 15, 18-21 налоговой декларации "
+            "на основе ваших транзакций с конвертацией валют по курсу Национального банка Грузии.\n\n"
+            "Нажмите кнопку ниже, чтобы получить шаблон для ввода данных:"
+        )
+        button = "Получить шаблон"
+    else:
+        context.user_data["lang"] = "en"
+        welcome = (
+            "🎉 Welcome to the Georgia Tax Calculation Bot!\n\n"
+            "This bot will help you automatically calculate fields 15, 18-21 of your tax declaration "
+            "based on your transactions with currency conversion using National Bank of Georgia rates.\n\n"
+            "Click the button below to get the data entry template:"
+        )
+        button = "Receive template"
+    
+    keyboard = [[button]]
+    reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+    await update.message.reply_text(welcome, reply_markup=reply_markup)
     return AWAIT_SELECTION
 
 async def receive_template(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Send template file and instructions."""
     logger.info(f"Sending template to user {update.effective_user.id}")
-    # Send the template file and instructions
-    template = build_template_bytes()
+    lang = context.user_data.get("lang", "en")
+    
+    template = build_template_bytes(lang)
+    
+    if lang == "ru":
+        caption = (
+            "📊 БОТ ДЛЯ РАСЧЕТА НАЛОГОВ В ГРУЗИИ\n\n"
+            "Этот бот поможет вам рассчитать поля налоговой декларации для Дома Юстиции Грузии.\n\n"
+            "📋 КАК ЭТО РАБОТАЕТ:\n"
+            "1. Скачайте Excel шаблон ниже\n"
+            "2. Заполните данные о ваших транзакциях\n"
+            "3. Отправьте заполненный файл обратно боту\n"
+            "4. Получите рассчитанные суммы для полей декларации\n\n"
+            "📝 ОСНОВНЫЕ ПРАВИЛА:\n"
+            "• Столбцы: Сумма транзакции, Валюта, Дата транзакции, Источник дохода\n"
+            "• Валюта: GEL, EUR, USD\n"
+            "• Дата: ДД.ММ.ГГГГ (например, 14.08.2025)\n"
+            "• Форматы: Excel (.xlsx) или ссылки Google Sheets"
+        )
+        reply = "Отправьте заполненный .xlsx файл или ссылку на Google Sheets."
+        sheets_link = "Вы также можете сделать копию шаблона в Google Sheets: https://docs.google.com/spreadsheets/d/1no-hnrWP8mWEREK97oVAUJ4-Ki2GP9wkbgNPEKtfJMo/edit?usp=sharing"
+        detailed_instructions = build_detailed_income_instructions_ru()
+        filename = "налоговый_шаблон.xlsx"
+    else:
+        caption = build_instructions()
+        reply = "Send your filled .xlsx file or Google Sheets link."
+        sheets_link = "You can also make a copy of the template in Google Sheets: https://docs.google.com/spreadsheets/d/1no-hnrWP8mWEREK97oVAUJ4-Ki2GP9wkbgNPEKtfJMo/edit?usp=sharing"
+        detailed_instructions = build_detailed_income_instructions_en()
+        filename = "template.xlsx"
+    
     await update.message.reply_document(
-        document=InputFile(template, filename="template.xlsx"),
-        caption=build_instructions()
+        document=InputFile(template, filename=filename),
+        caption=caption
     )
-    await update.message.reply_text(
-        "Send your filled .xlsx file.",
-        reply_markup=ReplyKeyboardRemove()
-    )
+    await update.message.reply_text(detailed_instructions)
+    await update.message.reply_text(reply, reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text(sheets_link)
     return AWAIT_FILE
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    doc = update.message.document
-    logger.info(f"Received document {doc.file_name} from user {update.effective_user.id}")
-    if not doc or not doc.file_name.lower().endswith(".xlsx"):
-        await update.message.reply_text("Send a .xlsx file with the exact headers.")
+    """Handle file upload or Google Sheets link."""
+    lang = context.user_data.get("lang", "en")
+    
+    # Handle document upload
+    if update.message.document:
+        doc = update.message.document
+        logger.info(f"Received document {doc.file_name} from user {update.effective_user.id}")
+        
+        if not doc.file_name.lower().endswith(".xlsx"):
+            msg = "Send a .xlsx file with the exact headers." if lang == "en" else "Отправьте .xlsx файл с правильными заголовками."
+            await update.message.reply_text(msg)
+            return AWAIT_FILE
+        
+        file = await doc.get_file()
+        b = await file.download_as_bytearray()
+        
+        try:
+            df = get_tax_dataframe_from_file(b)
+            df = process_tax_dataframe(df, prev_month_amount=0.0)
+        except Exception as e:
+            msg = f"File error: {e}" if lang == "en" else f"Ошибка файла: {e}"
+            await update.message.reply_text(msg)
+            return AWAIT_FILE
+    
+    # Handle Google Sheets link
+    elif update.message.text and "docs.google.com/spreadsheets" in update.message.text:
+        link = update.message.text.strip()
+        logger.info(f"Received Google Sheets link: {link}")
+        
+        try:
+            creds_path = os.getenv('GOOGLE_KEY_PATH', 'service_account.json')
+            df = get_tax_dataframe_from_sheet(link, creds_path)
+            df = process_tax_dataframe(df, prev_month_amount=0.0)
+        except Exception as e:
+            msg = f"Error reading Google Sheet: {e}" if lang == "en" else f"Ошибка чтения Google Sheets: {e}"
+            await update.message.reply_text(msg)
+            return AWAIT_FILE
+    
+    else:
+        msg = "Send a .xlsx file or a Google Sheets link." if lang == "en" else "Отправьте .xlsx файл или ссылку на Google Sheets."
+        await update.message.reply_text(msg)
         return AWAIT_FILE
-
-    file = await doc.get_file()
-    b = await file.download_as_bytearray()
-    try:
-        bio = BytesIO(b)
-        # Process the tax data without previous amount
-        df = load_and_process_tax_data(bio, prev_month_amount=0.0)
-    except Exception as e:
-        await update.message.reply_text(f"File error: {e}")
-        return AWAIT_FILE
-    # Store DataFrame and ask for previous month amount
+    
+    # Store DataFrame and ask for previous amount
     context.user_data['tax_df'] = df
-    await update.message.reply_text("Received file. Please send previous period amount in GEL (e.g., 100000.00)")
+    msg = ("Received file. Please send previous period amount (field 15 from previous month declaration) in GEL (e.g., 100000.00)" 
+           if lang == "en" else 
+           "Файл получен. Пожалуйста, отправьте сумму за предыдущий период (поле 15 из декларации за предыдущий месяц) в GEL (например, 100000.00)")
+    await update.message.reply_text(msg)
     return AWAIT_PREV_AMOUNT
 
 async def handle_prev_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle previous amount input and calculate final results."""
     text = update.message.text.strip()
     logger.info(f"User {update.effective_user.id} provided previous amount: {text}")
+    lang = context.user_data.get("lang", "en")
+    
     try:
         prev_amount = float(text)
     except ValueError:
-        await update.message.reply_text("Please send a numeric amount, e.g., 100000.00")
+        msg = ("Please send a numeric amount, e.g., 100000.00" 
+               if lang == "en" else 
+               "Пожалуйста, отправьте числовое значение, например, 100000.00")
+        await update.message.reply_text(msg)
         return AWAIT_PREV_AMOUNT
+    
     df = context.user_data.get('tax_df')
     if df is None:
-        await update.message.reply_text("No tax file found. Send /start to begin.")
+        msg = ("No tax file found. Send /start to begin." 
+               if lang == "en" else 
+               "Файл не найден. Отправьте /start для начала.")
+        await update.message.reply_text(msg)
         return ConversationHandler.END
-    # Summarize income
+    
+    # Calculate fields
     fields = summarize_income(df, prev_amount)
-    # Send summary text
-    lines = [f"{k}: {v:.2f}" for k, v in fields.items()]
+    
+    if lang == "ru":
+        field_names = {
+            'Field 15': 'Поле 15 (лари с начала года)',
+            'Field 18': 'Поле 18 (Наличные)',
+            'Field 19': 'Поле 19 (POS-терминал)',
+            'Field 20': 'Поле 20 (Банковский перевод)',
+            'Field 21': 'Поле 21 (Платежная система)',
+        }
+        lines = [f"{field_names.get(k, k)}: {v:.2f}" for k, v in fields.items()]
+        restart = "Новый расчет"
+        msg = "Обработать другой файл? Нажмите ниже, чтобы начать заново:"
+        catebi = "Если бот был полезен, поддержите Catebi — благотворительную организацию, которая стерилизует бездомных кошек в Грузии: https://catebi.ge/donate"
+    else:
+        lines = [f"{k}: {v:.2f}" for k, v in fields.items()]
+        restart = "New tax"
+        msg = "Process another file? Click below to restart:"
+        catebi = "If you found this bot useful, please consider donating to Catebi — a non-profit Trap-Neuter-Return organization for stray cats in Georgia: https://catebi.ge/donate"
+    
+    # Send results
     await update.message.reply_text("\n".join(lines))
-    # Offer to start a new tax processing
-    from telegram import ReplyKeyboardMarkup
-    keyboard = [["New tax"]]
+    await update.message.reply_text(catebi)
+    
+    # Offer restart option
+    keyboard = [[restart]]
     reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
-    await update.message.reply_text(
-        "Process another file? Click below to restart:",
-        reply_markup=reply_markup
-    )
+    await update.message.reply_text(msg, reply_markup=reply_markup)
+    
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle conversation cancellation."""
     logger.info(f"User {update.effective_user.id} canceled conversation")
     await update.message.reply_text("Canceled.")
     return ConversationHandler.END
 
+# ---------- Main Application ----------
 def main():
+    """Main application entry point."""
     token = os.getenv("BOT_TOKEN")
     if not token:
         raise RuntimeError("Set BOT_TOKEN env var.")
@@ -257,23 +576,38 @@ def main():
     app = Application.builder().token(token).build()
 
     conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start), MessageHandler(filters.Regex(r'^New tax$'), start)],
+        entry_points=[
+            CommandHandler("start", start), 
+            MessageHandler(filters.Regex(r'^New tax$|^Новый расчет$'), start)
+        ],
         states={
-            AWAIT_SELECTION: [MessageHandler(filters.Regex(r'^Receive template$'), receive_template)],
-            AWAIT_FILE: [MessageHandler(
-                filters.Document.MimeType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-                | filters.Document.FileExtension("xlsx"),
-                handle_file
-            )],
-            AWAIT_PREV_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_prev_amount)]
+            AWAIT_LANGUAGE: [
+                MessageHandler(filters.Regex(r'^Русский$|^English$'), select_language)
+            ],
+            AWAIT_SELECTION: [
+                MessageHandler(filters.Regex(r'^Receive template$|^Получить шаблон$'), receive_template)
+            ],
+            AWAIT_FILE: [
+                MessageHandler(
+                    filters.Document.MimeType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                    | filters.Document.FileExtension("xlsx"),
+                    handle_file
+                ),
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND,
+                    handle_file
+                )
+            ],
+            AWAIT_PREV_AMOUNT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_prev_amount)
+            ]
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,
     )
 
     app.add_handler(conv)
-
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
