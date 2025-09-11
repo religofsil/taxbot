@@ -3,14 +3,17 @@
 ## What Users See When They Start the Bot
 
 ### 1. Language Selection
+
 When users send `/start`, they see:
-```
+
+```text
 Выберите язык / Choose your language:
 [Русский] [English]
 ```
 
 ### 2. Welcome Message (English)
-```
+
+```text
 🎉 Welcome to the Georgia Tax Calculation Bot!
 
 This bot will help you automatically calculate fields 15, 18-21 of your tax declaration based on your transactions with currency conversion using National Bank of Georgia rates.
@@ -20,7 +23,8 @@ Click the button below to get the data entry template:
 ```
 
 ### 2. Welcome Message (Russian)
-```
+
+```text
 🎉 Добро пожаловать в бот для расчета налогов в Грузии!
 
 Этот бот поможет вам автоматически рассчитать поля 15, 18-21 налоговой декларации на основе ваших транзакций с конвертацией валют по курсу Национального банка Грузии.
@@ -30,10 +34,12 @@ Click the button below to get the data entry template:
 ```
 
 ### 3. Detailed Instructions with Template (English)
+
 When users click "Receive template", they get:
 
 **Excel file attachment** with caption:
-```
+
+```text
 📊 TAX CALCULATION BOT FOR GEORGIA
 
 This bot helps you calculate tax declaration fields for Georgia Revenue Service.
@@ -88,7 +94,8 @@ This bot helps you calculate tax declaration fields for Georgia Revenue Service.
 ```
 
 **Follow-up messages:**
-```
+
+```text
 Send your filled .xlsx file or Google Sheets link.
 
 You can also make a copy of the template in Google Sheets: 
@@ -96,10 +103,12 @@ https://docs.google.com/spreadsheets/d/1no-hnrWP8mWEREK97oVAUJ4-Ki2GP9wkbgNPEKtf
 ```
 
 ### 3. Detailed Instructions with Template (Russian)
+
 When users click "Получить шаблон", they get:
 
 **Excel file attachment** with caption:
-```
+
+```text
 📊 БОТ ДЛЯ РАСЧЕТА НАЛОГОВ В ГРУЗИИ
 
 Этот бот поможет вам рассчитать поля налоговой декларации для Дома Юстиции Грузии.
@@ -156,7 +165,8 @@ When users click "Получить шаблон", they get:
 ```
 
 **Follow-up messages:**
-```
+
+```text
 Отправьте заполненный .xlsx файл или ссылку на Google Sheets.
 
 Вы также можете сделать копию шаблона в Google Sheets: 
