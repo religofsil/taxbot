@@ -60,3 +60,5 @@ ENV/
 
 # user logs
 *.log
+user_actions.txt
+user_starts.txt
