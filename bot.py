@@ -35,8 +35,11 @@ def log_user_start(user_id: int, username: str = None, first_name: str = None, l
     """Log when a user starts the bot."""
     try:
         timestamp = datetime.now().isoformat()
-        with open('data_logs/user_starts.txt', 'a', encoding='utf-8') as f:
-            f.write(f"{timestamp},{user_id},{username or 'N/A'},{first_name or 'N/A'},{last_name or 'N/A'}\n")
+        details = f"last_name={last_name or 'N/A'}"
+        with open('user_data.log', 'a', encoding='utf-8') as f:
+            f.write(
+                f"{timestamp} | USER_START | {user_id} | {username or 'N/A'} | {first_name or 'N/A'} | {details}\n"
+            )
     except Exception as e:
         logger.error(f"Failed to log user start: {e}")
 
@@ -44,17 +47,28 @@ def log_error(error_type: str, error_message: str, user_id: int = None, context:
     """Log errors with context."""
     try:
         timestamp = datetime.now().isoformat()
-        with open('data_logs/errors.txt', 'a', encoding='utf-8') as f:
-            f.write(f"{timestamp},{error_type},{error_message},{user_id or 'N/A'},{context or 'N/A'}\n")
+        with open('errors.log', 'a', encoding='utf-8') as f:
+            f.write(
+                f"{timestamp} | {user_id or 'N/A'} | {error_type} | {error_message} | {context or 'N/A'}\n"
+            )
     except Exception as e:
         logger.error(f"Failed to log error: {e}")
 
-def log_user_action(user_id: int, action: str, details: str = None):
+def log_user_action(
+    user_id: int,
+    action: str,
+    details: str = None,
+    *,
+    username: str = None,
+    first_name: str = None,
+):
     """Log user actions for analytics."""
     try:
         timestamp = datetime.now().isoformat()
-        with open('data_logs/user_actions.txt', 'a', encoding='utf-8') as f:
-            f.write(f"{timestamp},{user_id},{action},{details or 'N/A'}\n")
+        with open('user_data.log', 'a', encoding='utf-8') as f:
+            f.write(
+                f"{timestamp} | {action.upper()} | {user_id} | {username or 'N/A'} | {first_name or 'N/A'} | {details or 'N/A'}\n"
+            )
     except Exception as e:
         logger.error(f"Failed to log user action: {e}")
 
@@ -414,7 +428,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         first_name=user.first_name,
         last_name=user.last_name
     )
-    log_user_action(user.id, "start_bot", "Initial /start command")
+    log_user_action(
+        user.id,
+        "start_bot",
+        "Initial /start command",
+        username=user.username,
+        first_name=user.first_name,
+    )
     
     keyboard = [["Русский", "English"]]
     reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
@@ -431,7 +451,13 @@ async def select_language(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     
     if lang in ["русский", "ru"]:
         context.user_data["lang"] = "ru"
-        log_user_action(user.id, "language_selected", "Russian")
+        log_user_action(
+            user.id,
+            "language_selected",
+            "Russian",
+            username=user.username,
+            first_name=user.first_name,
+        )
         welcome = (
             "🎉 Добро пожаловать в бот для расчета налогов в Грузии!\n\n"
             "Этот бот поможет вам автоматически рассчитать поля 15, 18-21 налоговой декларации "
@@ -441,7 +467,13 @@ async def select_language(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         button = "Получить шаблон"
     else:
         context.user_data["lang"] = "en"
-        log_user_action(user.id, "language_selected", "English")
+        log_user_action(
+            user.id,
+            "language_selected",
+            "English",
+            username=user.username,
+            first_name=user.first_name,
+        )
         welcome = (
             "🎉 Welcome to the Georgia Tax Calculation Bot!\n\n"
             "This bot will help you automatically calculate fields 15, 18-21 of your tax declaration "
@@ -462,7 +494,13 @@ async def receive_template(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     lang = context.user_data.get("lang", "en")
     
     # Log template download
-    log_user_action(user.id, "template_requested", f"Language: {lang}")
+    log_user_action(
+        user.id,
+        "template_requested",
+        f"Language: {lang}",
+        username=user.username,
+        first_name=user.first_name,
+    )
     
     template = build_template_bytes(lang)
     
@@ -510,7 +548,13 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     if update.message.document:
         doc = update.message.document
         logger.info(f"Received document {doc.file_name} from user {user.id}")
-        log_user_action(user.id, "file_uploaded", f"Filename: {doc.file_name}, Size: {doc.file_size}")
+        log_user_action(
+            user.id,
+            "file_uploaded",
+            f"Filename: {doc.file_name}, Size: {doc.file_size}",
+            username=user.username,
+            first_name=user.first_name,
+        )
         
         if not doc.file_name.lower().endswith(".xlsx"):
             log_error("InvalidFileType", f"User uploaded non-xlsx file: {doc.file_name}", user.id, "file_upload")
@@ -524,7 +568,13 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         try:
             df = get_tax_dataframe_from_file(b)
             df = process_tax_dataframe(df, prev_month_amount=0.0)
-            log_user_action(user.id, "file_processed_success", f"Rows: {len(df)}")
+            log_user_action(
+                user.id,
+                "file_processed_success",
+                f"Rows: {len(df)}",
+                username=user.username,
+                first_name=user.first_name,
+            )
         except Exception as e:
             log_error("FileProcessingError", str(e), user.id, f"file_upload:{doc.file_name}")
             msg = f"File error: {e}" if lang == "en" else f"Ошибка файла: {e}"
@@ -535,13 +585,25 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     elif update.message.text and "docs.google.com/spreadsheets" in update.message.text:
         link = update.message.text.strip()
         logger.info(f"Received Google Sheets link: {link}")
-        log_user_action(user.id, "google_sheet_submitted", f"Link: {link}")
+        log_user_action(
+            user.id,
+            "google_sheet_submitted",
+            f"Link: {link}",
+            username=user.username,
+            first_name=user.first_name,
+        )
         
         try:
             creds_path = os.getenv('GOOGLE_KEY_PATH', 'service_account.json')
             df = get_tax_dataframe_from_sheet(link, creds_path)
             df = process_tax_dataframe(df, prev_month_amount=0.0)
-            log_user_action(user.id, "google_sheet_processed_success", f"Rows: {len(df)}")
+            log_user_action(
+                user.id,
+                "google_sheet_processed_success",
+                f"Rows: {len(df)}",
+                username=user.username,
+                first_name=user.first_name,
+            )
         except Exception as e:
             log_error("GoogleSheetError", str(e), user.id, f"google_sheet:{link}")
             msg = f"Error reading Google Sheet: {e}" if lang == "en" else f"Ошибка чтения Google Sheets: {e}"
@@ -549,7 +611,13 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
             return AWAIT_FILE
     
     else:
-        log_user_action(user.id, "invalid_input", "Neither xlsx file nor Google Sheets link")
+        log_user_action(
+            user.id,
+            "invalid_input",
+            "Neither xlsx file nor Google Sheets link",
+            username=user.username,
+            first_name=user.first_name,
+        )
         msg = "Send a .xlsx file or a Google Sheets link." if lang == "en" else "Отправьте .xlsx файл или ссылку на Google Sheets."
         await update.message.reply_text(msg)
         return AWAIT_FILE
@@ -571,7 +639,13 @@ async def handle_prev_amount(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     try:
         prev_amount = float(text)
-        log_user_action(user.id, "prev_amount_provided", f"Amount: {prev_amount}")
+        log_user_action(
+            user.id,
+            "prev_amount_provided",
+            f"Amount: {prev_amount}",
+            username=user.username,
+            first_name=user.first_name,
+        )
     except ValueError:
         log_error("InvalidAmount", f"User provided non-numeric amount: {text}", user.id, "prev_amount_input")
         msg = ("Please send a numeric amount, e.g., 100000.00" 
@@ -593,7 +667,13 @@ async def handle_prev_amount(update: Update, context: ContextTypes.DEFAULT_TYPE)
     fields = summarize_income(df, prev_amount)
     
     # Log successful calculation
-    log_user_action(user.id, "calculation_completed", f"Field15: {fields['Field 15']:.2f}, Transactions: {len(df)}")
+    log_user_action(
+        user.id,
+        "calculation_completed",
+        f"Field15: {fields['Field 15']:.2f}, Transactions: {len(df)}",
+        username=user.username,
+        first_name=user.first_name,
+    )
     
     if lang == "ru":
         field_names = {
@@ -631,7 +711,14 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     first_name = update.effective_user.first_name or "N/A"
     
     logger.info(f"User {user_id} canceled conversation")
-    log_user_action(user_id, username, first_name, "conversation_canceled", "User manually canceled the conversation")
+    details = f"User manually canceled the conversation (username={username}, first_name={first_name})"
+    log_user_action(
+        user_id,
+        "conversation_canceled",
+        details,
+        username=username,
+        first_name=first_name,
+    )
     
     await update.message.reply_text("Canceled.")
     return ConversationHandler.END
@@ -653,9 +740,10 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
         logger.error(error_message, exc_info=context.error)
         
         if user_id:
-            log_error(user_id, username, first_name, "unexpected_error", error_message)
+            context_details = f"username={username}, first_name={first_name}"
+            log_error("unexpected_error", error_message, user_id=user_id, context=context_details)
         else:
-            log_error("unknown", "N/A", "N/A", "unexpected_error", error_message)
+            log_error("unexpected_error", error_message, context="username=N/A, first_name=N/A")
             
     except Exception as e:
         logger.error(f"Error in error handler: {str(e)}")
